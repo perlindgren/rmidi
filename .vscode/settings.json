@@ -3,6 +3,7 @@
         "coremidi",
         "eframe",
         "rmidi",
-        "runloop"
+        "runloop",
+        "egui"
     ]
 }
