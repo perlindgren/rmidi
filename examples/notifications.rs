@@ -2,8 +2,24 @@ use core_foundation::runloop::CFRunLoop;
 
 use rmidi::midi_con::*;
 
+struct App {}
+
+impl App {
+    fn new() -> Self {
+        App {}
+    }
+
+    fn notification_callback(&self, notification: &Notification) {
+        println!("App received notification: {:?}", notification);
+    }
+}
+
 fn main() {
+    let app = App::new();
     let midi_con = ArcMutexMidiCon::new();
+    midi_con.set_notification_callback(move |notification: &Notification| {
+        app.notification_callback(notification);
+    });
 
     println!("Sources: {:?}", midi_con.list_sources());
 
