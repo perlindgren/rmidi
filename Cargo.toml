@@ -3,9 +3,11 @@ name = "rmidi"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 coremidi = "0.8.0"
+
+[dependencies]
 eframe = "0.33.2"
 egui = "0.33.2"
 env_logger = "0.11.8"
