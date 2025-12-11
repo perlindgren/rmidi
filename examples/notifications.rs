@@ -23,12 +23,12 @@ fn main() {
 
     println!("Sources: {:?}", midi_con.list_sources());
 
-    midi_con.connect_source(0, move |data, mc| {
+    midi_con.connect_source_by_index(0, move |data, mc| {
         println!("Received MIDI data from source 0: {:?}", data);
-        println!("MIDI Connections state: {:?}", mc.in_ports.keys());
+        println!("MIDI Connections state: {:?}", mc.list_sources());
     });
 
-    midi_con.connect_destination(0);
+    midi_con.connect_destination_by_index(0);
     midi_con.send(0, &[0xc0, 0x03]); // Program Change to program 2
 
     CFRunLoop::run_current();

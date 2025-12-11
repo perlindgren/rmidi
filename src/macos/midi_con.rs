@@ -1,6 +1,5 @@
 use coremidi::{
-    Client, Destination, Destinations, InputPort, OutputPort, PacketBuffer, PacketList, Source,
-    Sources,
+    Client, Destination, Destinations, InputPort, OutputPort, PacketBuffer, Source, Sources,
 };
 use log::trace;
 
@@ -58,20 +57,25 @@ impl ArcMutexMidiCon {
     }
 
     /// Connect to a MIDI source by its index with a callback for incoming data
-    pub fn connect_source(
+    pub fn connect_source_by_index(
         &self,
         source_index: usize,
-        cb: impl Fn(&PacketList, &mut MidiCon) -> () + Send + 'static,
+        cb: impl Fn(&[u8], &ArcMutexMidiCon) -> () + Send + 'static,
     ) {
         let midi_con = &mut self.0.lock().unwrap();
         if let Some(client) = &midi_con.opt_client {
+            if midi_con.in_ports.contains_key(&source_index) {
+                trace!("Already connected to source index: {}", source_index);
+            }
             trace!("Connecting to source index: {}", source_index);
             if let Some(source) = Source::from_index(source_index) {
                 let mc = self.clone();
                 let input_port = client
                     .input_port("input", move |packet_list| {
-                        let mut mc = mc.0.lock().unwrap();
-                        cb(packet_list, &mut *mc);
+                        // Convert PacketList to &[u8]
+                        for packet in packet_list.iter() {
+                            cb(packet.data(), &mc);
+                        }
                     })
                     .unwrap();
                 input_port.connect_source(&source).unwrap();
@@ -81,7 +85,46 @@ impl ArcMutexMidiCon {
         }
     }
 
-    /// List available MIDI sources by their display names
+    /// Connect to a MIDI source by its index with a callback for incoming data
+    pub fn connect_source_by_name(
+        &self,
+        source_name: &str,
+        cb: impl Fn(&[u8], &ArcMutexMidiCon) -> () + Send + 'static,
+    ) {
+        let midi_con = &mut self.0.lock().unwrap();
+        if let Some(client) = &midi_con.opt_client {
+            if let Some((_in_port, _)) = midi_con
+                .in_ports
+                .values()
+                .find(|(in_port, _)| in_port.name() == Some(source_name.to_string()))
+            {
+                trace!("Already connected to source name: {}", source_name);
+            }
+            trace!("Connecting to source name: {}", source_name);
+            if let Some(source) = Source::from_name(source_name) {
+                let mc = self.clone();
+                let input_port = client
+                    .input_port("input", move |packet_list| {
+                        // Convert PacketList to &[u8]
+                        for packet in packet_list.iter() {
+                            cb(packet.data(), &mc);
+                        }
+                    })
+                    .unwrap();
+                input_port.connect_source(&source).unwrap();
+                println!("Connected to source: {}", source.display_name().unwrap());
+                let (index, _) = Sources
+                    .into_iter()
+                    .enumerate()
+                    .find(|s| s.1 == source)
+                    .unwrap();
+
+                midi_con.in_ports.insert(index, (input_port, true));
+            };
+        }
+    }
+
+    /// List available MIDI sources by their names
     pub fn list_sources(&self) -> Vec<(usize, bool, String)> {
         trace!("Listing MIDI Sources:");
         Sources
@@ -91,15 +134,13 @@ impl ArcMutexMidiCon {
                 (
                     i,
                     self.0.lock().unwrap().in_ports.contains_key(&i),
-                    source
-                        .display_name()
-                        .unwrap_or_else(|| "Unknown".to_string()),
+                    source.name().unwrap_or_else(|| "Unknown".to_string()),
                 )
             })
             .collect()
     }
 
-    /// List available MIDI destinations by their display names
+    /// List available MIDI destinations by their names
     pub fn list_destinations(&self) -> Vec<(usize, bool, String)> {
         trace!("Listing MIDI Destinations:");
         Destinations
@@ -109,16 +150,14 @@ impl ArcMutexMidiCon {
                 (
                     i,
                     self.0.lock().unwrap().out_ports.contains_key(&i),
-                    destination
-                        .display_name()
-                        .unwrap_or_else(|| "Unknown".to_string()),
+                    destination.name().unwrap_or_else(|| "Unknown".to_string()),
                 )
             })
             .collect()
     }
 
     /// Connect to a MIDI destination by its index
-    pub fn connect_destination(&self, destination_index: usize) {
+    pub fn connect_destination_by_index(&self, destination_index: usize) {
         let midi_con = &mut self.0.lock().unwrap();
         if let Some(client) = &midi_con.opt_client {
             trace!("Connecting to destination index: {}", destination_index);
@@ -152,11 +191,21 @@ impl ArcMutexMidiCon {
         }
     }
 
+    /// Disconnect from a MIDI source by its index
     pub fn disconnect_source(&self, source_index: usize) {
         let midi_con = &mut self.0.lock().unwrap();
         if let Some(input_port) = midi_con.in_ports.remove(&source_index) {
             drop(input_port);
             trace!("Disconnected from source index: {}", source_index);
+        }
+    }
+
+    /// Disconnect from a MIDI destination by its index
+    pub fn disconnect_destination(&self, destination_index: usize) {
+        let midi_con = &mut self.0.lock().unwrap();
+        if let Some(output_port) = midi_con.out_ports.remove(&destination_index) {
+            drop(output_port);
+            trace!("Disconnected from destination index: {}", destination_index);
         }
     }
 }

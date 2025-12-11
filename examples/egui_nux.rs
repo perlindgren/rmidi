@@ -1,6 +1,10 @@
 use core_foundation::runloop::CFRunLoop;
-use coremidi::{Client, Endpoint, EventList, Notification, Object, Protocol, Source, Sources};
 use rmidi::midi_con::*;
+use std::{
+    collections::HashMap,
+    //hash::Hash,
+    sync::{Arc, Mutex},
+};
 
 // RUST_LOG="rmidi=trace" cargo run --example egui_nux
 
@@ -11,10 +15,17 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    let app = ArcMutexApp::new();
+    let cb_app = app.clone();
+    let midi_con = cb_app.0.lock().unwrap().midi_con.clone();
+    midi_con.set_notification_callback(move |notification: &Notification| {
+        cb_app.notification_callback(notification);
+    });
+
     eframe::run_native(
         "Rust NUX - Mighty Midi Controller",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|_cc| Ok(Box::new(app))),
     )
     .unwrap();
 
@@ -23,6 +34,16 @@ fn main() -> eframe::Result {
     loop {}
 }
 
+enum Learn {
+    None,
+    PreviousChannel,
+    NextChannel,
+}
+
+struct MidiMapper {
+    previous: Option<Vec<u8>>,
+    next: Option<Vec<u8>>,
+}
 struct App {
     midi_con: ArcMutexMidiCon,
     channels: [bool; 7],
@@ -31,20 +52,26 @@ struct App {
     sources: Vec<(usize, bool, String)>,
     destinations: Vec<(usize, bool, String)>,
     selected_source: usize,
+    learn: Learn,
+    midi_map: HashMap<usize, MidiMapper>,
 }
 
-impl App {
-    fn default() -> Self {
-        let midi_con = ArcMutexMidiCon::new();
+#[derive(Clone)]
+struct ArcMutexApp(Arc<Mutex<App>>);
 
-        midi_con.connect_destination(0);
-        midi_con.connect_source(0, |packet_list, midi_con| {
-            println!("Received MIDI data from source 0: {:?}", packet_list);
-            println!("MIDI Connections state: {:?}", midi_con.in_ports.keys());
-        });
+impl ArcMutexApp {
+    fn notification_callback(&self, notification: &Notification) {
+        println!("App received notification: {:?}", notification);
+    }
+
+    fn new() -> Self {
+        let midi_con = ArcMutexMidiCon::new();
+        midi_con.connect_destination_by_index(0);
+
         let sources = midi_con.list_sources();
         let destinations = midi_con.list_destinations();
-        Self {
+
+        ArcMutexApp(Arc::new(Mutex::new(App {
             midi_con,
             channels: [true; 7],
             selected_channel: 0,
@@ -52,7 +79,9 @@ impl App {
             sources,
             destinations,
             selected_source: 0,
-        }
+            learn: Learn::None,
+            midi_map: HashMap::new(),
+        })))
     }
 }
 
@@ -62,8 +91,9 @@ impl App {
     }
 }
 
-impl eframe::App for App {
+impl eframe::App for ArcMutexApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let app = &mut *self.0.lock().unwrap();
         ctx.request_repaint();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -92,63 +122,121 @@ impl eframe::App for App {
                     ui.heading("Name");
                     ui.end_row();
 
-                    for (i, connected, name) in self.sources.iter_mut() {
+                    for (i, connected, name) in app.sources.iter_mut() {
                         if ui.checkbox(&mut *connected, "").changed() {
                             if *connected {
                                 let source_index = *i;
-                                self.midi_con.connect_source(
+                                let cb_app = self.clone();
+                                app.midi_con.connect_source_by_index(
                                     source_index,
-                                    move |packet_list, midi_con| {
+                                    move |data, midi_con| {
+                                        let app = &mut *cb_app.0.lock().unwrap();
                                         println!(
                                             "Received MIDI data from source {}: {:?}",
-                                            source_index, packet_list
+                                            source_index, data
                                         );
-                                        println!(
-                                            "MIDI Connections state: {:?}",
-                                            midi_con.in_ports.keys()
-                                        );
+                                        midi_con.send(0, data);
+                                        match app.learn {
+                                            Learn::None => {
+                                                // Normal MIDI handling
+                                                if let Some(map) = app.midi_map.get(&source_index) {
+                                                    if let Some(prev) = &map.previous {
+                                                        if data == prev.as_slice() {
+                                                            // Previous channel
+                                                            let mut next = app.selected_channel;
+                                                            loop {
+                                                                next = (next + app.channels.len()
+                                                                    - 1)
+                                                                    % app.channels.len();
+                                                                if next == app.selected_channel
+                                                                    || app.channels[next]
+                                                                {
+                                                                    break; // No other channels available
+                                                                }
+                                                            }
+                                                            app.selected_channel = next;
+                                                            app.send_program_change();
+                                                            println!(
+                                                                "Selected channel: {}",
+                                                                app.selected_channel
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(next) = &map.next {
+                                                        if data == next.as_slice() {
+                                                            // Next channel
+                                                            let mut next = app.selected_channel;
+                                                            loop {
+                                                                next =
+                                                                    (next + 1) % app.channels.len();
+                                                                if next == app.selected_channel
+                                                                    || app.channels[next]
+                                                                {
+                                                                    break; // No other channels available
+                                                                }
+                                                            }
+                                                            app.selected_channel = next;
+                                                            app.send_program_change();
+                                                            println!(
+                                                                "Selected channel: {}",
+                                                                app.selected_channel
+                                                            );
+                                                            return;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                // MIDI Learn logic
+                                                let v = data.to_vec();
+                                                let map = app
+                                                    .midi_map
+                                                    .entry(source_index)
+                                                    .or_insert(MidiMapper {
+                                                        previous: None,
+                                                        next: None,
+                                                    });
+
+                                                match app.learn {
+                                                    Learn::PreviousChannel => {
+                                                        println!("Learn Previous Channel");
+                                                        map.previous = Some(v);
+                                                    }
+                                                    Learn::NextChannel => {
+                                                        println!("Learn Next Channel");
+                                                        map.next = Some(v);
+                                                    }
+                                                    _ => unreachable!(),
+                                                }
+                                                app.learn = Learn::None;
+                                            }
+                                        }
                                     },
                                 );
                             } else {
-                                self.midi_con.disconnect_source(*i);
+                                app.midi_con.disconnect_source(*i);
                             }
                         }
                         ui.label(format!("{}", name));
 
-                        // ui.checkbox(&mut self.channels[i], "");
-                        //  ui.radio_value(&mut self.selected_channel, i, "");
                         ui.end_row();
                     }
                 });
 
-            // egui::ComboBox::from_label("MIDI Source")
-            //     .selected_text(
-            //         self.sources
-            //             .get(self.selected_source)
-            //             .cloned()
-            //             .unwrap_or_else(|| "None".to_string()),
-            //     )
-            //     .show_ui(ui, |ui| {
-            //         for (i, name) in self.sources.iter().enumerate() {
-            //             ui.selectable_value(&mut self.selected_source, i, name);
-            //         }
-            //     });
-            // }
-
             ui.separator();
 
             ui.horizontal(|ui| {
-                for i in 0..self.channels.len() {
+                for i in 0..app.channels.len() {
                     ui.vertical(|ui| {
                         if ui
-                            .radio_value(&mut self.selected_channel, i, format!("Ch {}", i + 1))
+                            .radio_value(&mut app.selected_channel, i, format!("Ch {}", i + 1))
                             .clicked()
                         {
                             println!("Selected channel: {}", i + 1);
-                            self.send_program_change();
+                            app.send_program_change();
                         }
-                        if ui.checkbox(&mut self.channels[i], "").changed() {
-                            println!("Channel {} toggled to {}", i + 1, self.channels[i]);
+                        if ui.checkbox(&mut app.channels[i], "").changed() {
+                            println!("Channel {} toggled to {}", i + 1, app.channels[i]);
                         }
                     });
                 }
@@ -156,29 +244,41 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 if ui.button("<<<").clicked() {
-                    let mut next = self.selected_channel;
-                    loop {
-                        next = (next + self.channels.len() - 1) % self.channels.len();
-                        if next == self.selected_channel || self.channels[next] {
-                            break; // No other channels available
+                    if ui.input(|i| i.modifiers.shift) {
+                        // midi learn
+                        println!("Learn <<<");
+                        app.learn = Learn::PreviousChannel;
+                    } else {
+                        let mut next = app.selected_channel;
+                        loop {
+                            next = (next + app.channels.len() - 1) % app.channels.len();
+                            if next == app.selected_channel || app.channels[next] {
+                                break; // No other channels available
+                            }
                         }
+                        app.selected_channel = next;
+                        app.send_program_change();
+                        println!("Selected channel: {}", app.selected_channel);
                     }
-                    self.selected_channel = next;
-                    self.send_program_change();
-                    println!("Selected channel: {}", self.selected_channel);
                 }
 
                 if ui.button(">>>").clicked() {
-                    let mut next = self.selected_channel;
-                    loop {
-                        next = (next + 1) % self.channels.len();
-                        if next == self.selected_channel || self.channels[next] {
-                            break; // No other channels available
+                    if ui.input(|i| i.modifiers.shift) {
+                        // midi learn
+                        println!("Learn >>>");
+                        app.learn = Learn::NextChannel;
+                    } else {
+                        let mut next = app.selected_channel;
+                        loop {
+                            next = (next + 1) % app.channels.len();
+                            if next == app.selected_channel || app.channels[next] {
+                                break; // No other channels available
+                            }
                         }
+                        app.selected_channel = next;
+                        app.send_program_change();
+                        println!("Selected channel: {}", app.selected_channel);
                     }
-                    self.selected_channel = next;
-                    self.send_program_change();
-                    println!("Selected channel: {}", self.selected_channel);
                 }
             });
 
